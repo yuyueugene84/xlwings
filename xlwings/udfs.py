@@ -5,7 +5,8 @@ import re
 import tempfile
 import inspect
 from importlib import import_module
-from threading import Thread
+from queue import Queue
+import threading
 
 from win32com.client import Dispatch, CDispatch
 
@@ -16,28 +17,24 @@ from .utils import VBAWriter
 cache = {}
 
 
-class AsyncThread(Thread):
-    def __init__(self, pid, book_name, sheet_name, address, func, args, cache_key, expand):
-        Thread.__init__(self)
-        self.pid = pid
-        self.book = book_name
-        self.sheet = sheet_name
-        self.address = address
-        self.func = func
-        self.args = args
-        self.cache_key = cache_key
-        self.expand = expand
+def write_to_workbook():
+    while True:
+        thread_args = q.get()
 
-    def run(self):
-        cache[self.cache_key] = self.func(*self.args)
+        cache[thread_args['cache_key']] = thread_args['func'](*thread_args['args'])
 
-        if self.expand:
-            apps[self.pid].books[self.book].sheets[self.sheet][self.address].formula_array = \
-                apps[self.pid].books[self.book].sheets[self.sheet][self.address].formula_array
+        if thread_args['expand']:
+            apps[thread_args['pid']].books[thread_args['book']].sheets[thread_args['sheet']][thread_args['address']].formula_array = \
+                apps[thread_args['pid']].books[thread_args['book']].sheets[thread_args['sheet']][thread_args['address']].formula_array
         else:
-            apps[self.pid].books[self.book].sheets[self.sheet][self.address].formula = \
-                apps[self.pid].books[self.book].sheets[self.sheet][self.address].formula
+            apps[thread_args['pid']].books[thread_args['book']].sheets[thread_args['sheet']][thread_args['address']].formula = \
+                apps[thread_args['pid']].books[thread_args['book']].sheets[thread_args['sheet']][thread_args['address']].formula
 
+
+q = Queue()
+t = threading.Thread(target=write_to_workbook)
+t.daemon = True
+t.start()
 
 if PY3:
     try:
@@ -291,15 +288,14 @@ def call_udf(module_name, func_name, args, this_workbook=None, caller=None):
         else:
             # You can't pass pywin32 objects directly to threads
             xw_caller = Range(impl=xlplatform.Range(xl=caller))
-            thread = AsyncThread(xw_caller.sheet.book.app.pid,
-                                 xw_caller.sheet.book.name,
-                                 xw_caller.sheet.name,
-                                 xw_caller.address,
-                                 func,
-                                 args,
-                                 cache_key,
-                                 is_dynamic_array)
-            thread.start()
+            q.put({'pid': xw_caller.sheet.book.app.pid,
+                   'book': xw_caller.sheet.book.name,
+                   'sheet': xw_caller.sheet.name,
+                   'address': xw_caller.address,
+                   'func': func,
+                   'args': args,
+                   'cache_key': cache_key,
+                   'expand': is_dynamic_array})
             return [["#N/A waiting..." * xw_caller.columns.count] * xw_caller.rows.count]
     else:
         if is_dynamic_array:
