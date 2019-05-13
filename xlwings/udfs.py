@@ -9,6 +9,7 @@ from queue import Queue
 import threading
 
 from win32com.client import Dispatch, CDispatch
+import pywintypes
 
 from . import conversion, xlplatform, Range, apps, PY3
 from .utils import VBAWriter
@@ -17,22 +18,27 @@ from .utils import VBAWriter
 cache = {}
 
 
-def write_to_workbook():
+def write_async_to_workbook():
     while True:
         thread_args = q.get()
-
+        print(str(thread_args['args']) + ' in thread')
         cache[thread_args['cache_key']] = thread_args['func'](*thread_args['args'])
+        print(str(thread_args['args']) + ' in thread Wrote to cache')
 
         if thread_args['expand']:
+            print(str(thread_args['args']) + ' in thread Before Range Write')
             apps[thread_args['pid']].books[thread_args['book']].sheets[thread_args['sheet']][thread_args['address']].formula_array = \
-                apps[thread_args['pid']].books[thread_args['book']].sheets[thread_args['sheet']][thread_args['address']].formula_array
+                thread_args['formula_array']
+            print(str(thread_args['args']) + ' in thread After Range Write')
         else:
             apps[thread_args['pid']].books[thread_args['book']].sheets[thread_args['sheet']][thread_args['address']].formula = \
-                apps[thread_args['pid']].books[thread_args['book']].sheets[thread_args['sheet']][thread_args['address']].formula
+                thread_args['formula']
+        q.task_done()
+
 
 
 q = Queue()
-t = threading.Thread(target=write_to_workbook)
+t = threading.Thread(target=write_async_to_workbook)
 t.daemon = True
 t.start()
 
@@ -243,8 +249,9 @@ def get_udf_module(module_name):
 def get_cache_key(func, args, caller):
     """only use this if function is called from cells, not VBA"""
     xw_caller = Range(impl=xlplatform.Range(xl=caller))
-    return (func.__name__ + str(args) + str(xw_caller.sheet.book.app.pid) +
-            xw_caller.sheet.book.name + xw_caller.sheet.name + xw_caller.address.split(':')[0])
+    return (func.__name__ + str(xw_caller.sheet.book.app.pid) +
+            xw_caller.sheet.book.name + xw_caller.sheet.name + xw_caller.address.split(':')[0] +
+            str(args))
 
 
 def call_udf(module_name, func_name, args, this_workbook=None, caller=None):
@@ -279,33 +286,43 @@ def call_udf(module_name, func_name, args, this_workbook=None, caller=None):
         xlplatform.BOOK_CALLER = Dispatch(this_workbook)
 
     if func_info['async_mode'] and func_info['async_mode'] == 'threading':
-        cache_key = get_cache_key(func, args, caller)
-        cached_value = cache.get(cache_key)
+        print(str(args) + ' A requested cache_key')
+        cached_value = cache.get(get_cache_key(func, args, caller))
         if cached_value is not None:  # test against None as np arrays don't have a truth value
             if not is_dynamic_array:  # for dynamic arrays, the cache is cleared below
-                del cache[cache_key]
+                del cache[get_cache_key(func, args, caller)]
             ret = cached_value
         else:
             # You can't pass pywin32 objects directly to threads
             xw_caller = Range(impl=xlplatform.Range(xl=caller))
+
+            try:
+                # Can't get array_formula during dynamic array resizing
+                formula_array = caller.FormulaArray
+                cache['formula_array' + get_cache_key(func, args, caller)] = formula_array
+            except pywintypes.com_error:
+                formula_array = cache.get('formula_array' + get_cache_key(func, args, caller))
+
             q.put({'pid': xw_caller.sheet.book.app.pid,
                    'book': xw_caller.sheet.book.name,
                    'sheet': xw_caller.sheet.name,
                    'address': xw_caller.address,
                    'func': func,
                    'args': args,
-                   'cache_key': cache_key,
-                   'expand': is_dynamic_array})
+                   'cache_key': get_cache_key(func, args, caller),
+                   'expand': is_dynamic_array,
+                   'formula': caller.Formula,
+                   'formula_array': formula_array})
+            print(str(args) + ' put into queue')
             return [["#N/A waiting..." * xw_caller.columns.count] * xw_caller.rows.count]
     else:
         if is_dynamic_array:
-            cache_key = get_cache_key(func, args, caller)
-            cached_value = cache.get(cache_key)
+            cached_value = cache.get(get_cache_key(func, args, caller))
             if cached_value is not None:
                 ret = cached_value
             else:
                 ret = func(*args)
-                cache[cache_key] = ret
+                cache[get_cache_key(func, args, caller)] = ret
         else:
             ret = func(*args)
 
@@ -326,7 +343,8 @@ def call_udf(module_name, func_name, args, this_workbook=None, caller=None):
                 current_size[0] > result_size[0] or current_size[1] > result_size[1]
             ))
         else:
-            del cache[cache_key]
+            print(str(args) + ' B del cache: ' + get_cache_key(func, args, caller))
+            del cache[get_cache_key(func, args, caller)]
 
     return xl_result
 
